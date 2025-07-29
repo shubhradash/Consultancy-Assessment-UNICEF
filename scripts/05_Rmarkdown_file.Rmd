@@ -1,0 +1,137 @@
+---
+title: "Population-Weighted Health Coverage by Track Status"
+date: "2025-07-28"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: cerulean
+---
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(countrycode)
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+library(janitor)
+library(openxlsx)
+library(ggplot2)
+library(knitr)
+library(rmarkdown)
+
+# Load the long-format UNICEF data
+unicef_data <- read_csv("data/fusion_GLOBAL_DATAFLOW_UNICEF_1.0_.MNCH_ANC4+MNCH_SAB.csv")
+
+# Load mortality status data
+mortality_status_raw <- read_excel("data/On-track and off-track countries.xlsx")
+
+# Load WPP data
+pop_data <- read_excel("data/WPP2022_GEN_F01_DEMOGRAPHIC_INDICATORS_COMPACT_REV1.xlsx", sheet = "Projections", skip = 16, col_types = "text") %>%
+  clean_names() 
+  
+# Clean and prepare the UNICEF indicator data to only include country data
+unicef_data <- unicef_data %>% mutate(iso3c = countrycode(`REF_AREA:Geographic area`, origin = "country.name", destination = "iso3c"))
+
+unicef_countries_only <- unicef_data %>%
+  filter(!is.na(iso3c))
+
+unicef_latest <- unicef_countries_only %>%
+  group_by(iso3c,`INDICATOR:Indicator`) %>%
+  slice_max(order_by = `TIME_PERIOD:Time period`, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+unicef_wide <- unicef_latest %>%
+  select(iso3c, `REF_AREA:Geographic area`, `INDICATOR:Indicator`, `OBS_VALUE:Observation Value`) %>%
+  pivot_wider(names_from = `INDICATOR:Indicator`, values_from = `OBS_VALUE:Observation Value`) %>%
+  rename(anc4 =`MNCH_ANC4: Antenatal care 4+ visits - percentage of women (aged 15-49 years) attended at least four times during pregnancy by any provider`, sba = `MNCH_SAB: Skilled birth attendant - percentage of deliveries attended by skilled health personnel`)
+
+# Clean and prepare mortality status data
+mortality_status <- mortality_status_raw %>%
+  clean_names() %>%
+  filter(status_u5mr %in% c("Achieved", "On Track", "Acceleration Needed")) %>%
+  mutate(track_status = case_when(
+    status_u5mr %in% c("Achieved", "On Track") ~ "On Track",
+    status_u5mr == "Acceleration Needed" ~ "Off Track"
+  ))
+
+# Clean and prepare WPP (pop) data
+str(pop_data$births_thousands)
+
+birth_data <- pop_data %>%
+  filter(year == 2022, type == "Country/Area") %>%
+  mutate(
+    births_thousands = na_if(births_thousands, "..."),  # convert "..." to NA
+    projected_births_2022 = as.numeric(births_thousands) * 1000
+  ) %>%
+  select(
+    location = region_subregion_country_or_area,
+    iso3c = iso3_alpha_code,
+    projected_births_2022
+  )
+
+#Merge all dataset using consistent country identifiers
+merged_data <- mortality_status %>%
+  left_join(birth_data, by = c("iso3code" = "iso3c"))
+
+final_data <- merged_data %>%
+  left_join(unicef_wide, by = c("iso3code" = "iso3c"))
+  
+#Analysis  
+weighted_results <- final_data %>%
+  group_by(track_status) %>%
+  summarise(
+    weighted_anc4 = weighted.mean(anc4, projected_births_2022, na.rm = TRUE),
+    weighted_sba = weighted.mean(sba, projected_births_2022, na.rm = TRUE),
+    total_births = sum(projected_births_2022, na.rm = TRUE),
+    n_countries = n()
+  )
+
+weighted_results_long <- weighted_results %>%
+  pivot_longer(cols = starts_with("weighted_"), names_to = "indicator", values_to = "coverage") %>%
+  mutate(indicator = case_when(
+    indicator == "weighted_anc4" ~ "ANC4 Coverage",
+    indicator == "weighted_sba" ~ "SBA Coverage"
+  ))
+  
+#Visualization
+coverage_plot <- ggplot(weighted_results_long, aes(x = track_status, y = coverage, fill = indicator)) +
+  geom_col(position = "dodge") +
+  labs(title = "Population-Weighted Coverage by Track Status",
+       x = "Track Status",
+       y = "Coverage (%)") +
+  theme_minimal()
+
+ggsave("C:/Users/HP/Consultancy-Assessment-UNICEF/output/coverage_plot.png", plot = coverage_plot, width = 8, height = 6, dpi = 300)
+
+print(coverage_plot)
+```
+
+```{r interpretation, results='asis'}
+cat("
+The bar plot displays population-weighted health service coverage (ANC4 and SBA) by country track status. On average, “On Track” countries show higher coverage for both indicators: about 74% ANC4 coverage and over 85% SBA coverage, compared to lower levels in “Off Track” countries (around 57% for ANC4 and 67% for SBA). This suggests a strong association between being on track to meet child mortality goals and higher maternal health service access. This is expected as literature consistently shows that access to skilled birth attendance and antenatal care is strongly associated with reductions in neonatal and under-5 mortality. SBA and ANC4 are part of the continuum of care critical for both maternal and child health (Bhutta et al., 2014; Lawn et al., 2010).
+
+Caveats and assumptions:
+•	Missing Data Bias- Many countries lacked complete data (particularly for ANC4 or SBA), and were excluded from calculations. If these missing data are not random, for example, if countries with weaker health systems are also less likely to report, then the weighted averages may be overestimated, especially for Off Track countries.
+•	Unequal Data Availability Across Indicators- SBA data was available for more countries than ANC4, which can skew comparisons between indicators. Any interpretation comparing ANC4 and SBA directly must be cautious unless coverage data came from a common, balanced sample.
+•	Projected Births as Weights- Using projected births (2022) assumes that current coverage estimates apply equally across all births. However, coverage may vary within countries, especially across rural/urban or wealth divides. This weighting therefore emphasizes country-level differences, but hides within-country inequalities.
+•	Causality vs. Correlation- The observed association doesn't imply that better coverage causes lower under-5 mortality. It’s possible that countries doing well in multiple areas (health systems, education, governance) are simply performing better across the board, an example of confounding.
+•	Definitions and Data Sources:
+Some countries may define ANC4 or SBA differently or use different surveys (DHS, MICS, administrative data), which can affect comparability. For instance, “skilled” attendance may include different cadres of workers.
+
+### Positions Apllied 
+-Learning and Skills Data Analyst Consultant – Req. #581598
+-Household Survey Data Analyst Consultant – Req. #581656
+-Administrative Data Analyst – Req. #581696
+-Microdata Harmonization Consultant – Req. #581699
+
+")
+```
+
+---
+
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
